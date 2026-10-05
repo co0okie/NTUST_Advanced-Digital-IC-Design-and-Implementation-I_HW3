@@ -1,0 +1,23 @@
+# LaTeX build files
+*.aux
+*.log
+*.nav
+*.snm
+*.toc
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.xdv
+*.vrb
+*.lof
+*.lot
+/slides/main.pdf
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated submission archive
+/M11507401.zip

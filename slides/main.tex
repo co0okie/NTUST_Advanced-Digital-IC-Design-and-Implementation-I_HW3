@@ -1,0 +1,219 @@
+% !TeX program = xelatex
+\documentclass[aspectratio=169,11pt]{beamer}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\usepackage{booktabs}
+\usefonttheme[onlymath]{serif}
+
+\setsansfont{Noto Sans}
+\setmonofont[Scale=MatchLowercase]{FiraCode Nerd Font Mono}
+\setCJKmainfont[Path=fonts/,BoldFont=NotoSansTC-Bold.otf]{NotoSansTC-Regular.otf}
+\setCJKsansfont[Path=fonts/,BoldFont=NotoSansTC-Bold.otf]{NotoSansTC-Regular.otf}
+\setCJKmonofont[Path=fonts/,BoldFont=NotoSansTC-Bold.otf]{NotoSansTC-Regular.otf}
+\definecolor{reportblue}{RGB}{29,65,104}
+\setbeamercolor{structure}{fg=reportblue}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setlength{\tabcolsep}{7pt}
+
+\title{先進製程數位晶片設計實作（一）\\Homework 3}
+\author{\texorpdfstring{李品翰\\M11507401}{李品翰 M11507401}}
+\date{}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{研究動機與模型}
+  \small
+  浮點參數占用較多儲存空間。以定點量化降低模型大小，
+  同時維持分類準確率，作為後續硬體實作的參考。
+
+  \vspace{0.6em}
+  \centering
+  \begin{tabular}{lll}
+    \toprule
+    運算階段 & 設定 & 輸出大小 \\
+    \midrule
+    輸入 & $32\times32\times3$，扣除平均圖片 & $32\times32\times3$ \\
+    conv1、ReLU、pooling & $3\times3$，64 通道；$2\times2$ pooling & $16\times16\times64$ \\
+    conv2、ReLU、pooling & $3\times3$，128 通道；$2\times2$ pooling & $8\times8\times128$ \\
+    conv3、ReLU、pooling & $3\times3$，256 通道；$2\times2$ pooling & $4\times4\times256$ \\
+    fc1 & $4096\rightarrow512$ & $512\times1$ \\
+    fc2、softmax & $512\rightarrow10$ & $10\times1$ 機率 \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.5em}
+  \begin{flushleft}
+    \footnotesize
+    使用老師提供的 HW2 模型與 1,000 張 CIFAR-10 測試圖片；推論略過 dropout。\\
+    只量化既有參數，不重新訓練、不剪枝。目標：準確率 $>80\%$、平均位元數 $\leq16$。
+  \end{flushleft}
+\end{frame}
+
+\begin{frame}{儲存空間占比：集中壓縮主要三層}
+  \small
+  \centering
+  \begin{tabular}{llrr}
+    \toprule
+    設定 & 參數 & 數量 & 占比 \\
+    \midrule
+    \texttt{WL\_W(1)} & conv1 權重 & 1,728 & 0.070\% \\
+    \texttt{WL\_W(2)} & conv2 權重 & 73,728 & 2.977\% \\
+    \texttt{WL\_W(3)} & conv3 權重 & 294,912 & 11.908\% \\
+    \texttt{WL\_W(4)} & fc1 權重 & 2,097,152 & \textbf{84.676\%} \\
+    \texttt{WL\_W(5)} & fc2 權重 & 5,120 & 0.207\% \\
+    \texttt{WL\_B} & 五層 bias & 970 & 0.039\% \\
+    \texttt{WL\_M} & 平均圖片（$32\times32\times3$） & 3,072 & 0.124\% \\
+    \midrule
+    合計 & & \textbf{2,476,682} & \textbf{100\%} \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.5em}
+  \begin{flushleft}
+    \footnotesize
+    相同位元數下，\texttt{WL\_W(2:4)} 占 \textbf{99.560\%}；其餘僅占 \textbf{0.440\%}。\\
+    因此將其餘參數固定為 16 bits，優先降低 conv2、conv3 與 fc1 的位元數。\\
+  \end{flushleft}
+\end{frame}
+
+\begin{frame}{方法：定點量化}
+  \small
+  \textbf{WL} 為總位元數，\textbf{FL} 決定刻度 $2^{-FL}$。
+  對原參數 $x$ 四捨五入後做飽和截限，再還原為運算用數值：
+  \[
+    q=\min\!\left(\max\!\left(\operatorname{round}(x2^{FL}),-2^{WL-1}\right),
+    2^{WL-1}-1\right),\qquad \hat{x}=q2^{-FL}.
+  \]
+  超出範圍時取上下限；恰為半整數時向遠離零方向取整。
+
+  \vspace{0.4em}
+  \begin{itemize}
+    \item 權重採 per-channel：每個輸出通道獨立選 FL，同層共用 WL。
+    \item bias 與平均圖片，各組參數共用一個 FL。
+    \item 固定 WL 後，以 \texttt{choose\_fl} 選擇量化誤差最小的 FL。
+    \item activation 使用 32 bits，在輸入扣均值後、三個 ReLU 後與兩個 FC 後量化。
+  \end{itemize}
+  以平均平方誤差（MSE）衡量整組參數的量化誤差：
+  \[
+    \mathrm{MSE}=\frac{1}{N}\sum_{i=1}^{N}(x_i-\hat{x}_i)^2.
+  \]
+  $N$ 是這組參數的數量；MSE 越小，量化後越接近原始參數。
+\end{frame}
+
+\begin{frame}{方法：\texttt{choose\_fl} 搜尋流程}
+  \small
+  \begin{enumerate}
+    \item \textbf{起點：}根據 WL 與 $\max_i|x_i|$ 估算 FL，
+          若四捨五入後溢位，就降低 FL，直到全部數值放得下。
+    \item \textbf{逐一搜尋：}計算目前 FL 的 MSE，記錄目前最佳 MSE 與對應 FL，
+          接著將 FL 加 1。
+    \item \textbf{停止：}當目前 FL 的截限誤差
+          $E_{\mathrm{clip}}\geq\mathrm{MSE}_{\mathrm{best}}$，
+          停止搜尋並回傳最佳 FL。
+  \end{enumerate}
+
+  \vspace{0.5em}
+  \textbf{截限誤差：}只計算超出範圍的數值，與上下限之間的距離。
+  令可表示範圍為 $[l,u]$：
+  \[
+    E_{\mathrm{clip}}=\frac{1}{N}\sum_i
+      \left[\max(l-x_i,0)^2+\max(x_i-u,0)^2\right].
+  \]
+  FL 越大，範圍越小，截限誤差不會下降。當它已達到最佳 MSE，
+  後面的 FL 就不可能更好。
+  \vspace{0.3em}
+
+  \footnotesize
+  程式以總平方誤差比較；兩側同除以 $N$ 後，即為此處的 MSE，停止條件相同。
+\end{frame}
+
+
+
+\begin{frame}{主要實驗：16 bits 降至混合 2／3 bits}
+  \small
+  每組測試 1,000 張圖片，開啟 per-channel；conv1、fc2 權重及全部 bias、Mean
+  固定為 16 bits，僅調整 conv2、conv3、fc1。
+
+  \vspace{0.5em}
+  \centering
+  \begin{tabular}{lrrrr}
+    \toprule
+    主要三層設定 & 正確張數 & 準確率 & 平均 bits & 模型縮減 \\
+    \midrule
+    原始 FP32 & 845 & 84.5\% & 32.000000 & 0.000\% \\
+    $(16,16,16)$ & 845 & 84.5\% & 16.000000 & 50.000\% \\
+    $(8,8,8)$ & 846 & 84.6\% & 8.035176 & 74.890\% \\
+    $(4,4,4)$ & 828 & 82.8\% & 4.052764 & 87.335\% \\
+    $(3,3,3)$ & 824 & 82.4\% & 3.057161 & 90.446\% \\
+    \textbf{$(3,3,2)$} & \textbf{823} & \textbf{82.3\%} & \textbf{2.210402} & \textbf{93.092\%} \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.7em}
+  \begin{flushleft}
+    其餘參數固定 16 bits；平均 bits 依各組參數數量加權：
+    \[
+      \overline{WL}=\frac{\sum_t N_t WL_t}{\sum_t N_t},\qquad
+      \text{模型縮減}=\left(1-\frac{\overline{WL}}{32}\right)\times100\%.
+    \]
+  \end{flushleft}
+\end{frame}
+
+\begin{frame}{混合位元比較：保留 conv2、conv3 的精度}
+  \small
+  \centering
+  \begin{tabular}{lrrl}
+    \toprule
+    $(\text{conv2},\text{conv3},\text{fc1})$ & 準確率 & 平均 bits & 是否 $>80\%$ \\
+    \midrule
+    $(2,2,3)$ & 73.9\% & 2.908317 & 否 \\
+    $(2,3,2)$ & 76.6\% & 2.180634 & 否 \\
+    $(3,2,2)$ & 75.2\% & 2.091327 & 否 \\
+    \textbf{$(3,3,2)$} & \textbf{82.3\%} & \textbf{2.210402} & \textbf{是} \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.8em}
+  \begin{itemize}
+    \item 測試配置中，兩個主要卷積層皆保留 3 bits 才達到準確率要求。
+    \item 選擇 $(3,3,2)$：相較 $(3,3,3)$ 僅少答對 1 張，
+          平均位元數由 3.057161 降為 2.210402。
+  \end{itemize}
+  \footnotesize
+  其餘參數固定 16 bits。
+\end{frame}
+
+\begin{frame}{最終結果：達到目標，停止優化}
+  \small
+  \textbf{最終配置：}
+  \texttt{WL\_W=[16 3 3 2 16]}，\texttt{WL\_B=WL\_M=16}，
+  \texttt{WL\_A=32}，per-channel 開啟。
+
+  \vspace{0.6em}
+  \centering
+  \begin{tabular}{lrr}
+    \toprule
+    指標 & 原始模型 & 最終定點模型 \\
+    \midrule
+    準確率 & 84.5\% & \textbf{82.3\%} \\
+    平均 bits／參數 & 32 & \textbf{2.210402} \\
+    參數儲存大小 & 9,906,728 bytes & 684,308 bytes \\
+    模型剩餘比例 & 100\% & 6.908\% \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.5em}
+  \begin{flushleft}
+    準確率下降 \textbf{2.2 個百分點}，模型縮減 \textbf{93.092\%}，
+    壓縮倍率為 \textbf{14.477 倍}。\\[0.4em]
+    準確率 $>80\%$ 且平均 bits $\leq2.5$，已達程式評分公式的滿分條件；
+    因此停止進一步優化。
+  \end{flushleft}
+\end{frame}
+
+\end{document}
